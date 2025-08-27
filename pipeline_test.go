@@ -1,281 +1,395 @@
 package pipeline
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
-	"io"
-	"math/rand"
-	"net/http"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-var (
-	welcomer = NewDefaultNode[string]("welcomer", welcome)
-	nodeA    = NewDefaultNode[string]("nodeA", nodeAImpl)
-	nodeB    = NewDefaultNode[string]("nodeB", nodeBImpl)
-	nodeC    = NewDefaultNode[string]("nodeC", nodeCImpl)
-	nodeD    = NewDefaultNode[string]("nodeD", nodeDImpl)
-	nodeE    = NewDefaultNode[string]("nodeE", nodeEImpl)
-	nodeF    = NewDefaultNode[string]("nodeF", nodeFImpl)
-	nodeG    = NewDefaultNode[string]("nodeG", nodeGImpl)
-	nodeH    = NewDefaultNode[string]("nodeH", nodeHImpl)
-	printer0 = NewDefaultNode[string]("printer0", print0)
-	printer1 = NewDefaultNode[string]("printer1", print1)
-	printer2 = NewDefaultNode[string]("printer2", print2)
-)
+// TestBasicPipeline tests a simple linear pipeline
+func TestBasicPipeline(t *testing.T) {
+	// Create nodes
+	nodeA := NewNode[string, string]("nodeA",
+		func(ctx context.Context, input string) (string, error) {
+			return input + " -> A", nil
+		})
 
-func TestPipeline(t *testing.T) {
-	SetLevel(DebugLevel)
-	welcomer.SetNext(nodeA)
-	nodeA.SetNext(nodeB)
-	nodeB.SetNext(nodeC)
-	nodeC.SetNext(nodeD)
-	nodeD.SetNext(printer0)
-	nodeA.SetNext(nodeE)
-	nodeE.SetNext(nodeF)
-	nodeF.SetNext(printer1)
-	nodeC.SetNext(nodeG)
-	nodeG.SetNext(nodeH)
-	nodeH.SetNext(printer2)
-	p, err := NewPipeline(welcomer)
+	nodeB := NewNode[string, string]("nodeB",
+		func(ctx context.Context, input string) (string, error) {
+			return input + " -> B", nil
+		})
+
+	nodeC := NewNode[string, string]("nodeC",
+		func(ctx context.Context, input string) (string, error) {
+			t.Logf("Final result: %s -> C", input)
+			return input + " -> C", nil
+		})
+
+	// Connect nodes
+	nodeA.Connect(nodeB)
+	nodeB.Connect(nodeC)
+
+	// Create and start pipeline
+	pipeline, err := NewPipeline(nodeA)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Failed to create pipeline: %v", err)
 	}
-	doneSignal := p.Start()
-	go time.AfterFunc(time.Second*5, func() {
-		p.Stop()
-	})
-	producer(10, doneSignal)
-	p.Wait()
-	fmt.Println("latestJob processed: ", p.LatestJob())
-	fmt.Println("exit!")
+
+	ctx := context.Background()
+	if err := pipeline.Start(ctx); err != nil {
+		t.Fatalf("Failed to start pipeline: %v", err)
+	}
+
+	// Send test data
+	testData := []string{"test1", "test2", "test3"}
+	for _, data := range testData {
+		if err := pipeline.SendWithTimeout(data, 5*time.Second); err != nil {
+			t.Errorf("Failed to process %s: %v", data, err)
+		}
+	}
+
+	// Graceful shutdown
+	if err := pipeline.Stop(10 * time.Second); err != nil {
+		t.Errorf("Failed to stop pipeline: %v", err)
+	}
+
+	// Check metrics
+	metricsA := nodeA.Metrics()
+	if metricsA.ProcessedCount.Load() != int64(len(testData)) {
+		t.Errorf("Expected %d processed jobs, got %d",
+			len(testData), metricsA.ProcessedCount.Load())
+	}
 }
 
-func producer(num int, stopSignal chan struct{}) {
-	fmt.Printf("producer started, generate %d name\n", num)
-	for i := 0; i < num; i++ {
-		select {
-		case <-stopSignal:
-			fmt.Println("producer stop because of pipeline stop signal")
-			return
-		default:
-			if name, _ := nameGenerator(); name != "" {
-				go func(i int, name string) {
-					welcomer.jobReceiver(name)
-					fmt.Printf("producer send: %d %s\n", i, name)
-				}(i, name)
+// TestComplexDAG tests a diamond-shaped DAG
+func TestComplexDAG(t *testing.T) {
+	//     B -> D
+	//    /      \
+	//   A        F
+	//    \      /
+	//     C -> E
+
+	results := sync.Map{}
+
+	nodeA := NewNode[int, int]("A",
+		func(ctx context.Context, input int) (int, error) {
+			return input * 2, nil
+		})
+
+	nodeB := NewNode[int, int]("B",
+		func(ctx context.Context, input int) (int, error) {
+			return input + 10, nil
+		})
+
+	nodeC := NewNode[int, int]("C",
+		func(ctx context.Context, input int) (int, error) {
+			return input + 20, nil
+		})
+
+	nodeD := NewNode[int, int]("D",
+		func(ctx context.Context, input int) (int, error) {
+			return input * 3, nil
+		})
+
+	nodeE := NewNode[int, int]("E",
+		func(ctx context.Context, input int) (int, error) {
+			return input * 4, nil
+		})
+
+	nodeF := NewNode[int, any]("F",
+		func(ctx context.Context, input int) (any, error) {
+			results.Store(fmt.Sprintf("path-%d", input), true)
+			t.Logf("Result received at F: %d", input)
+			return nil, nil
+		})
+
+	// Build DAG
+	nodeA.Connect(nodeB)
+	nodeA.Connect(nodeC)
+	nodeB.Connect(nodeD)
+	nodeC.Connect(nodeE)
+	nodeD.Connect(nodeF)
+	nodeE.Connect(nodeF)
+
+	// Create and start pipeline
+	pipeline, err := NewPipeline(nodeA)
+	if err != nil {
+		t.Fatalf("Failed to create pipeline: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := pipeline.Start(ctx); err != nil {
+		t.Fatalf("Failed to start pipeline: %v", err)
+	}
+
+	// Send test data
+	if err := pipeline.SendWithTimeout(5, 5*time.Second); err != nil {
+		t.Errorf("Failed to process: %v", err)
+	}
+
+	// Give time for processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Check that both paths were executed
+	count := 0
+	results.Range(func(key, value interface{}) bool {
+		count++
+		return true
+	})
+
+	if count != 2 {
+		t.Errorf("Expected 2 paths to be executed, got %d", count)
+	}
+
+	// Cleanup
+	if err := pipeline.Stop(5 * time.Second); err != nil {
+		t.Errorf("Failed to stop pipeline: %v", err)
+	}
+}
+
+// TestErrorHandling tests error handling and retries
+func TestErrorHandling(t *testing.T) {
+	attempts := atomic.Int32{}
+
+	config := DefaultConfig()
+	config.MaxRetries = 2 // Explicitly enable retries for this test
+	config.RetryDelay = 10 * time.Millisecond
+
+	nodeA := NewNode[int, int]("nodeA",
+		func(ctx context.Context, input int) (int, error) {
+			attempt := attempts.Add(1)
+			if attempt < 3 {
+				return 0, fmt.Errorf("attempt %d failed", attempt)
 			}
-		}
+			return input * 2, nil
+		},
+		config)
+
+	pipeline, err := NewPipeline(nodeA)
+	if err != nil {
+		t.Fatalf("Failed to create pipeline: %v", err)
 	}
-	fmt.Println("producer finished")
+
+	ctx := context.Background()
+	if err := pipeline.Start(ctx); err != nil {
+		t.Fatalf("Failed to start pipeline: %v", err)
+	}
+
+	// Should succeed after retries
+	err = pipeline.SendWithTimeout(10, 5*time.Second)
+	if err != nil {
+		t.Errorf("Expected success after retries, got error: %v", err)
+	}
+
+	if attempts.Load() != 3 {
+		t.Errorf("Expected 3 attempts, got %d", attempts.Load())
+	}
+
+	pipeline.Stop(5 * time.Second)
 }
 
-func welcome(name string) (any, error) {
-	time.Sleep(time.Millisecond * time.Duration(1000+rand.Intn(2000)))
-	return "Hello " + name, nil
-}
+// TestContextCancellation tests proper context handling
+func TestContextCancellation(t *testing.T) {
+	processed := atomic.Bool{}
 
-func print0(str string) (any, error) {
-	fmt.Println(str + " via printer0")
-	return nil, nil
-}
-
-func print1(str string) (any, error) {
-	fmt.Println(str + " via printer1")
-	return nil, nil
-}
-func print2(str string) (any, error) {
-	fmt.Println(str + " via printer2")
-	return nil, nil
-}
-
-func nodeAImpl(str string) (any, error) {
-	time.Sleep(time.Millisecond * time.Duration(1000+rand.Intn(2000)))
-	return str + " from nodeA", nil
-}
-
-func nodeBImpl(str string) (any, error) {
-	time.Sleep(time.Millisecond * time.Duration(1000+rand.Intn(2000)))
-	return str + " -> nodeB", nil
-}
-
-func nodeCImpl(str string) (any, error) {
-	time.Sleep(time.Millisecond * time.Duration(1000+rand.Intn(2000)))
-	return str + " -> nodeC", nil
-}
-
-func nodeDImpl(str string) (any, error) {
-	time.Sleep(time.Millisecond * time.Duration(1000+rand.Intn(2000)))
-	return str + " -> nodeD", nil
-}
-
-func nodeEImpl(str string) (any, error) {
-	time.Sleep(time.Millisecond * time.Duration(1000+rand.Intn(2000)))
-	return str + " -> nodeE", nil
-}
-
-func nodeFImpl(str string) (any, error) {
-	time.Sleep(time.Millisecond * time.Duration(1000+rand.Intn(2000)))
-	return str + " -> nodeF", nil
-}
-
-func nodeGImpl(str string) (any, error) {
-	time.Sleep(time.Millisecond * time.Duration(1000+rand.Intn(2000)))
-	return str + " -> nodeG", nil
-}
-func nodeHImpl(str string) (any, error) {
-	time.Sleep(time.Millisecond * time.Duration(1000+rand.Intn(2000)))
-	return str + " -> nodeH", nil
-}
-
-func nameGenerator() (string, error) {
-	if resp, err := http.Get("https://api.namefake.com/"); err != nil {
-		return "", err
-	} else {
-		if body, err := io.ReadAll(resp.Body); err != nil {
-			return "", err
-		} else {
-			var res = struct {
-				Name string `json:"name"`
-			}{}
-			err = json.Unmarshal(body, &res)
-			if err != nil {
-				return "", err
+	nodeA := NewNode[string, string]("nodeA",
+		func(ctx context.Context, input string) (string, error) {
+			select {
+			case <-time.After(1 * time.Second):
+				processed.Store(true)
+				return input + " processed", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
 			}
-			return res.Name, nil
+		})
+
+	pipeline, err := NewPipeline(nodeA)
+	if err != nil {
+		t.Fatalf("Failed to create pipeline: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := pipeline.Start(ctx); err != nil {
+		t.Fatalf("Failed to start pipeline: %v", err)
+	}
+
+	// Send job with short timeout
+	err = pipeline.SendWithTimeout("test", 100*time.Millisecond)
+	if err == nil {
+		t.Error("Expected timeout error")
+	}
+
+	if processed.Load() {
+		t.Error("Job should not have been processed")
+	}
+
+	pipeline.Stop(5 * time.Second)
+}
+
+// TestCircuitBreaker tests circuit breaker functionality
+func TestCircuitBreaker(t *testing.T) {
+	failures := atomic.Int32{}
+
+	config := DefaultConfig()
+	config.CircuitBreaker.Enabled = true // Explicitly enable circuit breaker
+	config.CircuitBreaker.FailureThreshold = 3
+	config.MaxRetries = 0 // No retries for this test
+
+	nodeA := NewNode[int, int]("nodeA",
+		func(ctx context.Context, input int) (int, error) {
+			failures.Add(1)
+			return 0, errors.New("always fails")
+		},
+		config)
+
+	pipeline, err := NewPipeline(nodeA)
+	if err != nil {
+		t.Fatalf("Failed to create pipeline: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := pipeline.Start(ctx); err != nil {
+		t.Fatalf("Failed to start pipeline: %v", err)
+	}
+
+	// Send jobs until circuit opens
+	for i := 0; i < 5; i++ {
+		err := pipeline.SendWithTimeout(i, 1*time.Second)
+		if err != nil && err.Error() == "circuit breaker open for node nodeA" {
+			t.Logf("Circuit breaker opened after %d failures", failures.Load())
+			break
 		}
+	}
+
+	if failures.Load() < 3 {
+		t.Error("Circuit breaker should have opened")
+	}
+
+	pipeline.Stop(5 * time.Second)
+}
+
+// TestCycleDetection tests that cycles are detected
+func TestCycleDetection(t *testing.T) {
+	nodeA := NewNode[string, string]("A",
+		func(ctx context.Context, s string) (string, error) {
+			return s, nil
+		})
+
+	nodeB := NewNode[string, string]("B",
+		func(ctx context.Context, s string) (string, error) {
+			return s, nil
+		})
+
+	nodeC := NewNode[string, string]("C",
+		func(ctx context.Context, s string) (string, error) {
+			return s, nil
+		})
+
+	// Create cycle: A -> B -> C -> A
+	nodeA.Connect(nodeB)
+	nodeB.Connect(nodeC)
+	nodeC.Connect(nodeA)
+
+	_, err := NewPipeline(nodeA)
+	if err == nil {
+		t.Error("Expected cycle detection error")
+	}
+
+	if err.Error() != "pipeline validation failed: pipeline contains cycle" {
+		t.Errorf("Unexpected error: %v", err)
 	}
 }
 
-func TestPipeline_HasCycle(t *testing.T) {
-	// Test work function
-	dummyWork := func(s string) (any, error) {
-		return s, nil
+// TestHighThroughput tests pipeline under high load
+func TestHighThroughput(t *testing.T) {
+	processed := atomic.Int64{}
+
+	config := DefaultConfig()
+	config.Workers = 8
+	config.BufferSize = 100
+
+	nodeA := NewNode[int, int]("nodeA",
+		func(ctx context.Context, input int) (int, error) {
+			processed.Add(1)
+			return input * 2, nil
+		},
+		config)
+
+	pipeline, err := NewPipeline(nodeA)
+	if err != nil {
+		t.Fatalf("Failed to create pipeline: %v", err)
 	}
 
-	t.Run("no cycle", func(t *testing.T) {
-		// A -> B -> C
-		nodeA := NewDefaultNode[string]("A", dummyWork)
-		nodeB := NewDefaultNode[string]("B", dummyWork)
-		nodeC := NewDefaultNode[string]("C", dummyWork)
+	ctx := context.Background()
+	if err := pipeline.Start(ctx); err != nil {
+		t.Fatalf("Failed to start pipeline: %v", err)
+	}
 
-		nodeA.SetNext(nodeB)
-		nodeB.SetNext(nodeC)
+	// Send many jobs concurrently
+	jobCount := 1000
+	var wg sync.WaitGroup
+	errors := atomic.Int32{}
 
-		p, _ := NewPipeline(nodeA)
-		if p.hasCycle() {
-			t.Error("pipeline should not have cycle")
-		}
-	})
+	start := time.Now()
 
-	t.Run("direct cycle", func(t *testing.T) {
-		// A -> B -> A (direct cycle)
-		nodeA := NewDefaultNode[string]("A", dummyWork)
-		nodeB := NewDefaultNode[string]("B", dummyWork)
+	for i := 0; i < jobCount; i++ {
+		wg.Add(1)
+		go func(val int) {
+			defer wg.Done()
+			if err := pipeline.SendWithTimeout(val, 5*time.Second); err != nil {
+				errors.Add(1)
+			}
+		}(i)
+	}
 
-		nodeA.SetNext(nodeB)
-		nodeB.SetNext(nodeA)
+	wg.Wait()
+	elapsed := time.Since(start)
 
-		p, err := NewPipeline(nodeA)
-		if err == nil || p != nil {
-			t.Error("pipeline creation should fail due to cycle")
-		}
-	})
+	if errors.Load() > 0 {
+		t.Errorf("Had %d errors processing jobs", errors.Load())
+	}
 
-	t.Run("indirect cycle", func(t *testing.T) {
-		// A -> B -> C -> A (indirect cycle)
-		nodeA := NewDefaultNode[string]("A", dummyWork)
-		nodeB := NewDefaultNode[string]("B", dummyWork)
-		nodeC := NewDefaultNode[string]("C", dummyWork)
+	throughput := float64(processed.Load()) / elapsed.Seconds()
+	t.Logf("Processed %d jobs in %v (%.0f jobs/sec)",
+		processed.Load(), elapsed, throughput)
 
-		nodeA.SetNext(nodeB)
-		nodeB.SetNext(nodeC)
-		nodeC.SetNext(nodeA)
+	// Check metrics
+	metrics := nodeA.Metrics()
+	avgLatency := metrics.GetAverageLatency()
+	t.Logf("Average latency: %v", avgLatency)
 
-		p, err := NewPipeline(nodeA)
-		if err == nil || p != nil {
-			t.Error("pipeline creation should fail due to cycle")
-		}
-	})
+	pipeline.Stop(10 * time.Second)
+}
 
-	t.Run("multiple branches without cycle", func(t *testing.T) {
-		/*
-			A ---> B ---> C
-			 \
-			  \
-			   -> D -> E
-		*/
-		nodeA := NewDefaultNode[string]("A", dummyWork)
-		nodeB := NewDefaultNode[string]("B", dummyWork)
-		nodeC := NewDefaultNode[string]("C", dummyWork)
-		nodeD := NewDefaultNode[string]("D", dummyWork)
-		nodeE := NewDefaultNode[string]("E", dummyWork)
+// BenchmarkPipeline benchmarks pipeline throughput
+func BenchmarkPipeline(b *testing.B) {
+	nodeA := NewNode[int, int]("nodeA",
+		func(ctx context.Context, input int) (int, error) {
+			return input * 2, nil
+		})
 
-		nodeA.SetNext(nodeB)
-		nodeB.SetNext(nodeC)
-		nodeA.SetNext(nodeD)
-		nodeD.SetNext(nodeE)
+	nodeB := NewNode[int, int]("nodeB",
+		func(ctx context.Context, input int) (int, error) {
+			return input + 10, nil
+		})
 
-		p, err := NewPipeline(nodeA)
-		if err != nil {
-			t.Error("pipeline should be created successfully")
-		}
-		if p.hasCycle() {
-			t.Error("pipeline should not have cycle")
-		}
-	})
+	nodeA.Connect(nodeB)
 
-	t.Run("multiple branches with cycle in one path", func(t *testing.T) {
-		/*
-			A ---> B ---> C
-			 \           ^
-			  \          |
-			   -> D -----+
-		*/
-		nodeA := NewDefaultNode[string]("A", dummyWork)
-		nodeB := NewDefaultNode[string]("B", dummyWork)
-		nodeC := NewDefaultNode[string]("C", dummyWork)
-		nodeD := NewDefaultNode[string]("D", dummyWork)
+	pipeline, _ := NewPipeline(nodeA)
+	ctx := context.Background()
+	pipeline.Start(ctx)
+	defer pipeline.Stop(5 * time.Second)
 
-		nodeA.SetNext(nodeB)
-		nodeB.SetNext(nodeC)
-		nodeA.SetNext(nodeD)
-		nodeD.SetNext(nodeC)
-
-		p, err := NewPipeline(nodeA)
-		if err != nil {
-			t.Error("pipeline should be created successfully")
-		}
-		if p.hasCycle() {
-			t.Error("pipeline should not have cycle as paths are separate")
-		}
-	})
-
-	t.Run("diamond pattern", func(t *testing.T) {
-		/*
-			   B
-			  / \
-			A    D
-			  \ /
-			   C
-		*/
-		nodeA := NewDefaultNode[string]("A", dummyWork)
-		nodeB := NewDefaultNode[string]("B", dummyWork)
-		nodeC := NewDefaultNode[string]("C", dummyWork)
-		nodeD := NewDefaultNode[string]("D", dummyWork)
-
-		nodeA.SetNext(nodeB)
-		nodeA.SetNext(nodeC)
-		nodeB.SetNext(nodeD)
-		nodeC.SetNext(nodeD)
-
-		p, err := NewPipeline(nodeA)
-		if err != nil {
-			t.Error("pipeline should be created successfully")
-		}
-		if p.hasCycle() {
-			t.Error("pipeline should not have cycle")
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			pipeline.SendWithTimeout(i, time.Second)
+			i++
 		}
 	})
 }

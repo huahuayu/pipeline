@@ -1,50 +1,26 @@
 # Pipeline
 
-Pipeline is a high-performance, concurrent data processing library for Go that enables you to build flexible pipelines.
+A fast, concurrent go pipeline library for Go with support for complex DAGs, automatic retries, and circuit breakers.
 
-It's an implementation for this original thought: [How to design a pipeline in go](https://liushiming.cn/article/how-to-design-a-pipeline-in-go.html).
+## Performance
 
-![](https://cdn.liushiming.cn/img/20221007130328.png)
+Tested on Apple M1 Pro. Pretty happy with these numbers:
 
-## Features
+| Pipeline    | Latency | Throughput   | Memory    |
+| ----------- | ------- | ------------ | --------- |
+| Single Node | 1.8 μs  | 547K ops/sec | 792 B/op  |
+| Two Nodes   | 5.2 μs  | 192K ops/sec | 1.4 KB/op |
+| Three Nodes | 8.8 μs  | 113K ops/sec | 2.1 KB/op |
 
-- **High Concurrency**: Process data in parallel with configurable worker pools at each pipeline stage
-- **Type Safety with Generics**: Leverage Go's generics for compile-time type checking between pipeline stages
-- **Graceful Shutdown**: Clean termination that waits for in-progress jobs to complete
-- **Cycle Detection**: Automatic detection and prevention of circular dependencies that could cause deadlocks
-- **Flexible Error Handling**: Customize error handling with your own error handler functions
-- **Job Tracking**: Monitor pipeline progress by retrieving the latest job processed (can be used to log break point)
-- **Directed Acyclic Graph (DAG)**: Complex pipeline with multi branchs are supported
+The actual processing is around 40ns per node. Most of the overhead comes from Go's channels and scheduling, which honestly isn't much we can optimize further.
 
-## Key Components
-
-### Pipeline Structure
-
-- Implements a DAG (Directed Acyclic Graph) architecture
-- Provides cycle detection to prevent deadlocks
-- Supports complex topologies with multiple branches
-
-### Node Implementation
-
-- Uses Go generics for type safety between pipeline stages
-- Each node has:
-  - A processing function
-  - Configurable worker pool size
-  - Job queue with configurable size
-  - Error handling capabilities
-  - Ability to track the latest processed job
-
-### Concurrency Model
-
-- Uses Go channels for communication between nodes
-- Implements worker pools for parallel processing
-- Provides graceful shutdown mechanism
-- Uses sync.WaitGroup for coordinating workers
-
-### Logging System
-
-- Four log levels: Trace, Debug, Info, Error
-- Configurable log level
+```
+BenchmarkThroughput-8         2,824,549    6,878 ns/op    145,394 ops/sec
+BenchmarkLatencyBreakdown:
+  SingleNode-8                6,675,679    1,825 ns/op    792 B/op     13 allocs/op
+  TwoNodes-8                  2,331,255    5,202 ns/op    1,464 B/op   26 allocs/op
+  ThreeNodes-8                1,372,046    8,771 ns/op    2,136 B/op   39 allocs/op
+```
 
 ## Installation
 
@@ -52,179 +28,227 @@ It's an implementation for this original thought: [How to design a pipeline in g
 go get github.com/huahuayu/pipeline
 ```
 
-## Quick Start
+## Basic Example
 
-Create a simple pipeline `A ─> B ─> C` then start, stop & wait for grace shutdown.
+Here's the simplest case - a two-stage pipeline that converts strings to uppercase and then counts characters:
 
 ```go
 package main
 
 import (
-  "fmt"
-  "time"
+    "context"
+    "fmt"
+    "strings"
+    "time"
 
-  "github.com/huahuayu/pipeline"
+    "github.com/huahuayu/pipeline"
 )
 
 func main() {
-  // Create processing nodes
-  nodeA := pipeline.NewDefaultNode[string]("nodeA", func(input string) (any, error) {
-    return input + " processed by A", nil
-  })
+    // First node: convert to uppercase
+    toUpper := pipeline.NewNode[string, string]("uppercase",
+        func(ctx context.Context, input string) (string, error) {
+            return strings.ToUpper(input), nil
+        })
 
-  nodeB := pipeline.NewDefaultNode[string]("nodeB", func(input string) (any, error) {
-    return input + " -> B", nil
-  })
+    // Second node: count characters
+    counter := pipeline.NewNode[string, int]("counter",
+        func(ctx context.Context, input string) (int, error) {
+            return len(input), nil
+        })
 
-  nodeC := pipeline.NewDefaultNode[string]("nodeC", func(input string) (any, error) {
-    fmt.Println("Result:", input+" -> C")
-    return nil, nil
-  })
+    // Wire them together
+    toUpper.Connect(counter)
 
-  // Connect nodes
-  nodeA.SetNext(nodeB)
-  nodeB.SetNext(nodeC)
+    // Create pipeline starting from the first node
+    p, err := pipeline.NewPipeline(toUpper)
+    if err != nil {
+        panic(err)
+    }
 
-  // Create and start the pipeline
-  p, err := pipeline.NewPipeline(nodeA)
-  if err != nil {
-    panic(err)
-  }
+    // Start it up
+    ctx := context.Background()
+    if err := p.Start(ctx); err != nil {
+        panic(err)
+    }
 
-  p.Start()
-  // Send jobs to the pipeline
-  p.JobReceiver("Job 1")
-  p.JobReceiver("Job 2")
-  p.JobReceiver("Job 3")
+    // Send some data
+    if err := p.SendWithTimeout("hello world", 5*time.Second); err != nil {
+        fmt.Printf("Failed: %v\n", err)
+    }
 
-  // Wait for a while to let jobs process
-  time.Sleep(2 * time.Second)
-
-  // Stop the pipeline
-  p.Stop()
-  p.Wait()
-
-  fmt.Println("Pipeline processing complete")
+    // Clean shutdown
+    if err := p.Stop(10*time.Second); err != nil {
+        fmt.Printf("Shutdown error: %v\n", err)
+    }
 }
 ```
 
-## Advanced Usage
+## Features
 
-### Creating Complex Topologies
+- **Type-safe with generics** - No interface{} shenanigans, full compile-time type checking
+- **DAG support** - Not just linear pipelines, build any directed acyclic graph
+- **Context aware** - Proper cancellation and timeout support throughout
+- **Panic recovery** - Workers handle panics gracefully
+- **Built-in metrics** - Track throughput, latency, queue sizes
+- **Circuit breakers** - Prevent cascading failures (disabled by default)
+- **Retries with backoff** - Configurable retry logic (disabled by default)
+- **Zero dependencies** - Just standard library
 
-The pipeline library supports Directed Acyclic Graph (DAG) structures, allowing you to create advanced processing workflows where data can flow through multiple parallel paths.
+## Configuration
 
-For example, you can create a branche topology where:
-
-- Data starts at node A
-- Flows through two parallel branches (B-D and C-E-F)
-
-```
-    ┌── B ──► D
-    │
-A ──┴── C ─── E ───► F
-```
-
-Here's how to construct this topology in code:
+By default, the pipeline runs with minimal features enabled (fail-fast mode). You can enable more complex behavior when needed:
 
 ```go
-// First create all nodes with their processing functions
-nodeA := pipeline.NewDefaultNode[InputType]("nodeA", nodeAProcessingFunc)
-nodeB := pipeline.NewDefaultNode[TypeFromA]("nodeB", nodeBProcessingFunc)
-nodeC := pipeline.NewDefaultNode[TypeFromA]("nodeC", nodeCProcessingFunc)
-nodeD := pipeline.NewDefaultNode[TypeFromB]("nodeD", nodeDProcessingFunc)
-nodeE := pipeline.NewDefaultNode[TypeFromC]("nodeE", nodeEProcessingFunc)
-nodeF := pipeline.NewDefaultNode[TypeFromDorE]("nodeF", nodeFProcessingFunc)
+config := pipeline.NodeConfig{
+    BufferSize: 100,    // Job queue size
+    Workers:    8,      // Concurrent workers
 
-// Then connect the nodes according to the desired topology
-nodeA.SetNext(nodeB)  // A outputs to B
-nodeA.SetNext(nodeC)  // A also outputs to C
-nodeB.SetNext(nodeD)  // B outputs to D
-nodeC.SetNext(nodeE)  // C outputs to E
-nodeE.SetNext(nodeF)  // E outputs to F
-```
+    // Retries are disabled by default
+    MaxRetries: 3,
+    RetryDelay: 100 * time.Millisecond,
 
-Data will flow through all possible paths.
-
-### Custom Worker Pool Configuration
-
-Customize the number of workers and job queue size:
-
-```go
-// Create a node with 5 workers and a job queue size of 10
-nodeA := pipeline.NewNode[string]("nodeA", processFunc, 10, 5, nil)
-```
-
-### Custom Error Handling
-
-Provide custom error handling logic:
-
-```go
-errorHandler := func(err error) {
-    // Custom error handling logic
-    log.Printf("Error in pipeline: %v", err)
-    metrics.IncrementErrorCounter()
+    // Circuit breaker is disabled by default
+    CircuitBreaker: pipeline.CircuitBreakerConfig{
+        Enabled:          true,
+        FailureThreshold: 5,
+        ResetTimeout:     30 * time.Second,
+    },
 }
 
-nodeA := pipeline.NewNode[string]("nodeA", processFunc, 10, 5, errorHandler)
+node := pipeline.NewNode[Input, Output]("my-node", processFunc, config)
 ```
 
-## API Reference
+## Building DAGs
 
-### Node Creation
+You're not limited to linear pipelines. Here's a diamond pattern:
 
 ```go
-// Create a node with default configuration
-NewDefaultNode[T any](name string, workFn func(T) (any, error), onError ...func(error)) *Node[T]
+// Build this graph:
+//     B -> D
+//    /      \
+//   A        F
+//    \      /
+//     C -> E
 
-// Create a node with custom configuration
-NewNode[T any](name string, workFn func(T) (any, error), jobPoolSize int, workerPoolSize int, onError ...func(error)) *Node[T]
+nodeA.Connect(nodeB)
+nodeA.Connect(nodeC)
+nodeB.Connect(nodeD)
+nodeC.Connect(nodeE)
+nodeD.Connect(nodeF)
+nodeE.Connect(nodeF)
+
+// The pipeline figures out the topology automatically
+p, _ := pipeline.NewPipeline(nodeA)
 ```
 
-### Pipeline Management
+## Error Handling
+
+Errors are collected and available after processing:
 
 ```go
-// Create a new pipeline with a root node
-NewPipeline(root INode) (*Pipeline, error)
+node := pipeline.NewNode[string, string]("validator",
+    func(ctx context.Context, input string) (string, error) {
+        if input == "" {
+            return "", errors.New("empty input not allowed")
+        }
+        return input, nil
+    }).WithErrorHandler(func(err error) {
+        // Log it, send to metrics, whatever you need
+        log.Printf("Validation failed: %v", err)
+    })
 
-// Start the pipeline
-Start() chan struct{}
-
-// Stop the pipeline
-Stop()
-
-// Wait for all nodes to finish processing
-Wait()
-
-// Get the latest job processed by the pipeline
-LatestJob() any
+// After processing, check for errors
+errors := p.Errors()
+for _, err := range errors {
+    log.Printf("Pipeline error: %v", err)
+}
 ```
 
-### Logging
+## Monitoring
+
+Each node tracks its own metrics:
 
 ```go
-// Set the log level
-SetLevel(l LogLevel)
-
-// Log levels
-TraceLevel
-DebugLevel
-InfoLevel
-ErrorLevel
+metrics := node.Metrics()
+fmt.Printf("Processed: %d\n", metrics.ProcessedCount.Load())
+fmt.Printf("Failed: %d\n", metrics.FailedCount.Load())
+fmt.Printf("Queue size: %d\n", metrics.CurrentQueueSize.Load())
+fmt.Printf("Avg latency: %v\n", metrics.GetAverageLatency())
 ```
+
+## Context and Cancellation
+
+Everything respects context cancellation:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+// This will respect the timeout
+err := p.Send(ctx, data)
+if errors.Is(err, context.DeadlineExceeded) {
+    // Handle timeout
+}
+```
+
+## Architecture Notes
+
+The pipeline is built around a few core ideas:
+
+1. **Generic nodes** - Each node is strongly typed with input/output types
+2. **Worker pools** - Each node runs N workers processing jobs concurrently
+3. **Buffered channels** - Used for job queues with configurable buffer sizes
+4. **Result channels** - Synchronous handoff between nodes provides natural backpressure
+5. **State management** - Atomic operations ensure thread safety without heavy locking
+
+### Latency Breakdown
+
+For a typical two-node pipeline processing, here's where the ~5μs goes:
+
+- Creating context: ~100ns
+- Channel send/receive: ~2000ns (multiple hops)
+- Goroutine scheduling: ~1000ns
+- Actual work: ~80ns (40ns per node)
+- Result propagation: ~2000ns
+
+Most overhead is from Go's runtime, not the pipeline itself.
+
+## Testing
+
+```bash
+# Standard tests
+go test ./...
+
+# Race detection (always passes!)
+go test -race ./...
+
+# Benchmarks
+go test -bench=. -benchmem
+
+# Coverage
+go test -cover ./...
+```
+
+Check out `pipeline_test.go` for more examples including stress tests, error scenarios, and complex DAG configurations.
+
+## Tips
+
+1. **Start simple** - Use defaults first, add complexity only when needed
+2. **Size buffers appropriately** - Too small causes backpressure, too large wastes memory
+3. **One pipeline per flow** - Don't try to reuse pipelines for different data flows
+4. **Always call Stop()** - Ensures graceful shutdown and cleanup
+5. **Monitor in production** - The built-in metrics are there for a reason
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+PRs welcome. Just make sure:
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-Please make sure your code passes all tests.
+- Tests pass (including race detector)
+- Benchmarks don't regress significantly
+- New features include tests
+- Public APIs have godoc comments
 
 ## License
 
-This project is licensed under the MIT License.
+MIT
