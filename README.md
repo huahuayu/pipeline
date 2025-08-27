@@ -2,6 +2,10 @@
 
 A fast, concurrent go pipeline library for Go with support for complex DAGs, automatic retries, and circuit breakers.
 
+It's an implementation for this original thought: [How to design a pipeline in go](https://liushiming.cn/article/how-to-design-a-pipeline-in-go.html).
+
+![](https://cdn.liushiming.cn/img/20221007130328.png)
+
 ## Performance
 
 Tested on Apple M1 Pro. Pretty happy with these numbers:
