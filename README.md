@@ -150,12 +150,6 @@ config := pipeline.NodeConfig{
     Workers:    8,                       // Concurrent workers
     MaxRetries: 3,                       // Retry attempts (0 = disabled)
     RetryDelay: 100 * time.Millisecond,  // Base delay (exponential backoff)
-
-    CircuitBreaker: pipeline.CircuitBreakerConfig{
-        Enabled:          true,          // Enable circuit breaker
-        FailureThreshold: 5,             // Open after 5 failures
-        ResetTimeout:     30 * time.Second, // Try again after 30s
-    },
 }
 
 node := pipeline.NewNode[In, Out]("name", processor, config)
@@ -260,23 +254,6 @@ config := pipeline.NodeConfig{
 // Retry delays: 100ms -> 200ms -> 400ms (exponential backoff)
 ```
 
-### Circuit Breaker
-
-Prevents cascading failures:
-
-```go
-config := pipeline.NodeConfig{
-    CircuitBreaker: pipeline.CircuitBreakerConfig{
-        Enabled:          true,
-        FailureThreshold: 5,              // Open after 5 consecutive failures
-        ResetTimeout:     30 * time.Second, // Try half-open after 30s
-    },
-}
-
-// States: Closed -> Open -> Half-Open -> Closed
-//         (normal)  (fail fast) (test one) (recovered)
-```
-
 ## Async Mode
 
 By default, `p.Send()` blocks until the item traverses the entire pipeline. For high-throughput scenarios where you want "fire-and-forget" behavior, enable Async Mode:
@@ -344,30 +321,11 @@ prometheus.Histogram("pipeline_latency_seconds").Observe(avgLatency.Seconds())
 
 Tested on Apple M1 Pro:
 
-| Pipeline    | Latency | Throughput   | Memory    |
-| ----------- | ------- | ------------ | --------- |
-| Single Node | 1.8 μs  | 547K ops/sec | 792 B/op  |
-| Two Nodes   | 5.2 μs  | 192K ops/sec | 1.4 KB/op |
-| Three Nodes | 8.8 μs  | 113K ops/sec | 2.1 KB/op |
-
 ```
-BenchmarkThroughput-8         2,824,549    6,878 ns/op    145,394 ops/sec
-BenchmarkLatencyBreakdown:
-  SingleNode-8                6,675,679    1,825 ns/op    792 B/op     13 allocs/op
-  TwoNodes-8                  2,331,255    5,202 ns/op    1,464 B/op   26 allocs/op
-  ThreeNodes-8                1,372,046    8,771 ns/op    2,136 B/op   39 allocs/op
+BenchmarkPipeline-8      1000000              1152 ns/op              24 B/op          2 allocs/op
 ```
 
-### Where Time Goes
-
-For a two-node pipeline (~5μs):
-
-- Channel operations: ~2000ns
-- Goroutine scheduling: ~1000ns
-- Result propagation: ~2000ns
-- Actual processing: ~80ns
-
-Most overhead is Go runtime, not the pipeline.
+The benchmark test `BenchmarkPipeline` sets up a simple pipeline with two nodes (A -> B) and processes integers.
 
 ## API Reference
 
@@ -393,13 +351,12 @@ Most overhead is Go runtime, not the pipeline.
 
 ### NodeConfig Fields
 
-| Field            | Type     | Default  | Description              |
-| ---------------- | -------- | -------- | ------------------------ |
-| `BufferSize`     | int      | NumCPU×4 | Job queue capacity       |
-| `Workers`        | int      | NumCPU   | Concurrent workers       |
-| `MaxRetries`     | int      | 0        | Retry attempts           |
-| `RetryDelay`     | Duration | 100ms    | Base retry delay         |
-| `CircuitBreaker` | Config   | disabled | Circuit breaker settings |
+| Field        | Type     | Default  | Description        |
+| ------------ | -------- | -------- | ------------------ |
+| `BufferSize` | int      | NumCPU×4 | Job queue capacity |
+| `Workers`    | int      | NumCPU   | Concurrent workers |
+| `MaxRetries` | int      | 0        | Retry attempts     |
+| `RetryDelay` | Duration | 100ms    | Base retry delay   |
 
 ## Testing
 
@@ -432,11 +389,9 @@ go test -v -run TestComplexDAG
 
 - ✅ **Type-safe generics** — Full compile-time type checking
 - ✅ **DAG support** — Build any directed acyclic graph
-  - ✅ **Async Mode** — Non-blocking execution for high throughput
   - ✅ **Simple API** — Just `Start(ctx)`, `Send()`, `Stop()`
 - ✅ **Panic recovery** — Workers handle panics gracefully
 - ✅ **Built-in metrics** — Throughput, latency, queue sizes
-- ✅ **Circuit breakers** — Prevent cascading failures
 - ✅ **Exponential backoff** — Smart retry logic
 - ✅ **Zero dependencies** — Only standard library
 
