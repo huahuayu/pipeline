@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -34,26 +33,25 @@ func TestBasicPipeline(t *testing.T) {
 	nodeB.Connect(nodeC)
 
 	// Create and start pipeline
-	pipeline, err := NewPipeline(nodeA)
+	p, err := NewPipeline(nodeA)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
 
-	ctx := context.Background()
-	if err := pipeline.Start(ctx); err != nil {
+	if err := p.Start(context.Background()); err != nil {
 		t.Fatalf("Failed to start pipeline: %v", err)
 	}
 
 	// Send test data
 	testData := []string{"test1", "test2", "test3"}
 	for _, data := range testData {
-		if err := pipeline.SendWithTimeout(data, 5*time.Second); err != nil {
+		if err := p.Send(data); err != nil {
 			t.Errorf("Failed to process %s: %v", data, err)
 		}
 	}
 
 	// Graceful shutdown
-	if err := pipeline.Stop(10 * time.Second); err != nil {
+	if err := p.Stop(10 * time.Second); err != nil {
 		t.Errorf("Failed to stop pipeline: %v", err)
 	}
 
@@ -116,18 +114,17 @@ func TestComplexDAG(t *testing.T) {
 	nodeE.Connect(nodeF)
 
 	// Create and start pipeline
-	pipeline, err := NewPipeline(nodeA)
+	p, err := NewPipeline(nodeA)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
 
-	ctx := context.Background()
-	if err := pipeline.Start(ctx); err != nil {
+	if err := p.Start(context.Background()); err != nil {
 		t.Fatalf("Failed to start pipeline: %v", err)
 	}
 
 	// Send test data
-	if err := pipeline.SendWithTimeout(5, 5*time.Second); err != nil {
+	if err := p.Send(5); err != nil {
 		t.Errorf("Failed to process: %v", err)
 	}
 
@@ -146,7 +143,7 @@ func TestComplexDAG(t *testing.T) {
 	}
 
 	// Cleanup
-	if err := pipeline.Stop(5 * time.Second); err != nil {
+	if err := p.Stop(5 * time.Second); err != nil {
 		t.Errorf("Failed to stop pipeline: %v", err)
 	}
 }
@@ -156,7 +153,7 @@ func TestErrorHandling(t *testing.T) {
 	attempts := atomic.Int32{}
 
 	config := DefaultConfig()
-	config.MaxRetries = 2 // Explicitly enable retries for this test
+	config.MaxRetries = 2
 	config.RetryDelay = 10 * time.Millisecond
 
 	nodeA := NewNode[int, int]("nodeA",
@@ -169,107 +166,29 @@ func TestErrorHandling(t *testing.T) {
 		},
 		config)
 
-	pipeline, err := NewPipeline(nodeA)
+	p, err := NewPipeline(nodeA)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
 
-	ctx := context.Background()
-	if err := pipeline.Start(ctx); err != nil {
+	if err := p.Start(context.Background()); err != nil {
 		t.Fatalf("Failed to start pipeline: %v", err)
 	}
 
 	// Should succeed after retries
-	err = pipeline.SendWithTimeout(10, 5*time.Second)
+	err = p.Send(10)
 	if err != nil {
 		t.Errorf("Expected success after retries, got error: %v", err)
 	}
+
+	// Give time for async retries
+	time.Sleep(100 * time.Millisecond)
 
 	if attempts.Load() != 3 {
 		t.Errorf("Expected 3 attempts, got %d", attempts.Load())
 	}
 
-	pipeline.Stop(5 * time.Second)
-}
-
-// TestContextCancellation tests proper context handling
-func TestContextCancellation(t *testing.T) {
-	processed := atomic.Bool{}
-
-	nodeA := NewNode[string, string]("nodeA",
-		func(ctx context.Context, input string) (string, error) {
-			select {
-			case <-time.After(1 * time.Second):
-				processed.Store(true)
-				return input + " processed", nil
-			case <-ctx.Done():
-				return "", ctx.Err()
-			}
-		})
-
-	pipeline, err := NewPipeline(nodeA)
-	if err != nil {
-		t.Fatalf("Failed to create pipeline: %v", err)
-	}
-
-	ctx := context.Background()
-	if err := pipeline.Start(ctx); err != nil {
-		t.Fatalf("Failed to start pipeline: %v", err)
-	}
-
-	// Send job with short timeout
-	err = pipeline.SendWithTimeout("test", 100*time.Millisecond)
-	if err == nil {
-		t.Error("Expected timeout error")
-	}
-
-	if processed.Load() {
-		t.Error("Job should not have been processed")
-	}
-
-	pipeline.Stop(5 * time.Second)
-}
-
-// TestCircuitBreaker tests circuit breaker functionality
-func TestCircuitBreaker(t *testing.T) {
-	failures := atomic.Int32{}
-
-	config := DefaultConfig()
-	config.CircuitBreaker.Enabled = true // Explicitly enable circuit breaker
-	config.CircuitBreaker.FailureThreshold = 3
-	config.MaxRetries = 0 // No retries for this test
-
-	nodeA := NewNode[int, int]("nodeA",
-		func(ctx context.Context, input int) (int, error) {
-			failures.Add(1)
-			return 0, errors.New("always fails")
-		},
-		config)
-
-	pipeline, err := NewPipeline(nodeA)
-	if err != nil {
-		t.Fatalf("Failed to create pipeline: %v", err)
-	}
-
-	ctx := context.Background()
-	if err := pipeline.Start(ctx); err != nil {
-		t.Fatalf("Failed to start pipeline: %v", err)
-	}
-
-	// Send jobs until circuit opens
-	for i := 0; i < 5; i++ {
-		err := pipeline.SendWithTimeout(i, 1*time.Second)
-		if err != nil && err.Error() == "circuit breaker open for node nodeA" {
-			t.Logf("Circuit breaker opened after %d failures", failures.Load())
-			break
-		}
-	}
-
-	if failures.Load() < 3 {
-		t.Error("Circuit breaker should have opened")
-	}
-
-	pipeline.Stop(5 * time.Second)
+	p.Stop(5 * time.Second)
 }
 
 // TestCycleDetection tests that cycles are detected
@@ -319,20 +238,19 @@ func TestHighThroughput(t *testing.T) {
 		},
 		config)
 
-	pipeline, err := NewPipeline(nodeA)
+	p, err := NewPipeline(nodeA)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
 
-	ctx := context.Background()
-	if err := pipeline.Start(ctx); err != nil {
+	if err := p.Start(context.Background()); err != nil {
 		t.Fatalf("Failed to start pipeline: %v", err)
 	}
 
 	// Send many jobs concurrently
 	jobCount := 1000
 	var wg sync.WaitGroup
-	errors := atomic.Int32{}
+	errCount := atomic.Int32{}
 
 	start := time.Now()
 
@@ -340,8 +258,8 @@ func TestHighThroughput(t *testing.T) {
 		wg.Add(1)
 		go func(val int) {
 			defer wg.Done()
-			if err := pipeline.SendWithTimeout(val, 5*time.Second); err != nil {
-				errors.Add(1)
+			if err := p.Send(val); err != nil {
+				errCount.Add(1)
 			}
 		}(i)
 	}
@@ -349,8 +267,8 @@ func TestHighThroughput(t *testing.T) {
 	wg.Wait()
 	elapsed := time.Since(start)
 
-	if errors.Load() > 0 {
-		t.Errorf("Had %d errors processing jobs", errors.Load())
+	if errCount.Load() > 0 {
+		t.Errorf("Had %d errors processing jobs", errCount.Load())
 	}
 
 	throughput := float64(processed.Load()) / elapsed.Seconds()
@@ -362,7 +280,36 @@ func TestHighThroughput(t *testing.T) {
 	avgLatency := metrics.GetAverageLatency()
 	t.Logf("Average latency: %v", avgLatency)
 
-	pipeline.Stop(10 * time.Second)
+	p.Stop(10 * time.Second)
+}
+
+// TestPipelineStop tests graceful shutdown
+func TestPipelineStop(t *testing.T) {
+	processed := atomic.Int32{}
+
+	nodeA := NewNode[int, int]("nodeA",
+		func(ctx context.Context, input int) (int, error) {
+			time.Sleep(50 * time.Millisecond)
+			processed.Add(1)
+			return input, nil
+		})
+
+	p, _ := NewPipeline(nodeA)
+	p.Start(context.Background())
+
+	// Send a job
+	go p.Send(1)
+
+	// Wait a bit then stop
+	time.Sleep(10 * time.Millisecond)
+	err := p.Stop(5 * time.Second)
+
+	if err != nil {
+		t.Errorf("Stop failed: %v", err)
+	}
+
+	// Job should have been processed or pipeline stopped
+	t.Logf("Processed: %d", processed.Load())
 }
 
 // BenchmarkPipeline benchmarks pipeline throughput
@@ -379,16 +326,15 @@ func BenchmarkPipeline(b *testing.B) {
 
 	nodeA.Connect(nodeB)
 
-	pipeline, _ := NewPipeline(nodeA)
-	ctx := context.Background()
-	pipeline.Start(ctx)
-	defer pipeline.Stop(5 * time.Second)
+	p, _ := NewPipeline(nodeA)
+	p.Start(context.Background())
+	defer p.Stop(5 * time.Second)
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		i := 0
 		for pb.Next() {
-			pipeline.SendWithTimeout(i, time.Second)
+			p.Send(i)
 			i++
 		}
 	})

@@ -12,38 +12,38 @@ import (
 // Example demonstrates a simple text processing pipeline
 func Example() {
 	// Create nodes for text processing pipeline
+	normalize := pipeline.NewNode[string, string]("normalize",
+		func(ctx context.Context, text string) (string, error) {
+			return strings.Join(strings.Fields(text), " "), nil
+		})
+
 	uppercase := pipeline.NewNode[string, string]("uppercase",
 		func(ctx context.Context, text string) (string, error) {
 			return strings.ToUpper(text), nil
 		})
 
-	wordCount := pipeline.NewNode[string, int]("wordcount",
-		func(ctx context.Context, text string) (int, error) {
-			return len(strings.Fields(text)), nil
-		})
-
-	printer := pipeline.NewNode[int, any]("printer",
-		func(ctx context.Context, count int) (any, error) {
-			fmt.Printf("Word count: %d\n", count)
+	printer := pipeline.NewNode[string, any]("printer",
+		func(ctx context.Context, text string) (any, error) {
+			fmt.Println(text)
 			return nil, nil
 		})
 
-	// Connect nodes: uppercase -> wordCount -> printer
-	uppercase.Connect(wordCount)
-	wordCount.Connect(printer)
+	// Connect nodes: normalize -> uppercase -> printer
+	normalize.Connect(uppercase)
+	uppercase.Connect(printer)
 
 	// Create and start pipeline
-	p, _ := pipeline.NewPipeline(uppercase)
-	ctx := context.Background()
-	p.Start(ctx)
+	p, _ := pipeline.NewPipeline(normalize)
+	p.Start(context.Background())
 
 	// Process some text
-	p.SendWithTimeout("hello world from pipeline", 5*time.Second)
+	p.Send("  hello   world  ")
 
-	// Graceful shutdown
+	// Wait for processing to complete
+	time.Sleep(100 * time.Millisecond)
 	p.Stop(5 * time.Second)
 
-	// Output: Word count: 4
+	// Output: HELLO WORLD
 }
 
 // Example_complexDAG demonstrates a diamond-shaped DAG pipeline
@@ -96,11 +96,10 @@ func Example_complexDAG() {
 
 	// Create and start pipeline
 	p, _ := pipeline.NewPipeline(input)
-	ctx := context.Background()
-	p.Start(ctx)
+	p.Start(context.Background())
 
 	// Process: 5 -> 10 -> (20->60) and (30->120)
-	p.SendWithTimeout(5, 5*time.Second)
+	p.Send(5)
 
 	// Wait a bit for processing
 	time.Sleep(100 * time.Millisecond)
@@ -117,7 +116,7 @@ func Example_complexDAG() {
 func Example_errorHandling() {
 	attempts := 0
 	config := pipeline.DefaultConfig()
-	config.MaxRetries = 2 // Explicitly enable retries (default is 0)
+	config.MaxRetries = 2
 
 	// Create a node that fails initially then succeeds
 	processor := pipeline.NewNode[string, string]("processor",
@@ -129,16 +128,15 @@ func Example_errorHandling() {
 			return "SUCCESS: " + input, nil
 		},
 		config).WithErrorHandler(func(err error) {
-		fmt.Printf("Error handled: %v\n", err)
+		// Errors during retries are logged here
 	})
 
 	// Create pipeline
 	p, _ := pipeline.NewPipeline(processor)
-	ctx := context.Background()
-	p.Start(ctx)
+	p.Start(context.Background())
 
 	// Process with automatic retries
-	if err := p.SendWithTimeout("test", 5*time.Second); err != nil {
+	if err := p.Send("test"); err != nil {
 		fmt.Printf("Final error: %v\n", err)
 	} else {
 		fmt.Println("Processing succeeded after retries")

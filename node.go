@@ -14,11 +14,13 @@ import (
 type INode interface {
 	Name() string
 	Start(ctx context.Context) error
-	Process(ctx context.Context, job any) error
+	Process(job any) error
 	Connect(next INode)
 	Next() []INode
 	Wait()
 	Metrics() *NodeMetrics
+	AddUpstreamSource()
+	MarkInputClosed()
 }
 
 // NodeMetrics contains runtime metrics for a node
@@ -40,18 +42,10 @@ func (m *NodeMetrics) GetAverageLatency() time.Duration {
 
 // NodeConfig contains configuration for a node
 type NodeConfig struct {
-	BufferSize     int
-	Workers        int
-	MaxRetries     int
-	RetryDelay     time.Duration
-	CircuitBreaker CircuitBreakerConfig
-}
-
-// CircuitBreakerConfig configures the circuit breaker
-type CircuitBreakerConfig struct {
-	Enabled          bool
-	FailureThreshold int
-	ResetTimeout     time.Duration
+	BufferSize int
+	Workers    int
+	MaxRetries int
+	RetryDelay time.Duration
 }
 
 // DefaultConfig returns a sensible default configuration
@@ -60,13 +54,8 @@ func DefaultConfig() NodeConfig {
 	return NodeConfig{
 		BufferSize: numCPU * 4,
 		Workers:    numCPU,
-		MaxRetries: 0, // No retries by default
-		RetryDelay: time.Millisecond * 100,
-		CircuitBreaker: CircuitBreakerConfig{
-			Enabled:          false, // Disabled by default
-			FailureThreshold: 5,
-			ResetTimeout:     30 * time.Second,
-		},
+		MaxRetries: 0,
+		RetryDelay: 100 * time.Millisecond,
 	}
 }
 
@@ -94,36 +83,17 @@ type Node[In, Out any] struct {
 	// Error handling
 	onError func(error)
 
-	// Circuit breaker
-	breaker *CircuitBreaker
+	// Object pool
+	jobPool sync.Pool
+
+	// Upstream tracking
+	upstreamSources atomic.Int32
 }
 
 // Job represents a unit of work
 type Job[T any] struct {
-	ctx    context.Context
-	data   T
-	result chan Result
+	data T
 }
-
-// Result represents the outcome of processing
-type Result struct {
-	Data any
-	Err  error
-}
-
-// CircuitBreaker implements circuit breaker pattern
-type CircuitBreaker struct {
-	state           atomic.Int32
-	failures        atomic.Int32
-	lastFailureTime atomic.Int64
-	config          CircuitBreakerConfig
-}
-
-const (
-	circuitClosed int32 = iota
-	circuitOpen
-	circuitHalfOpen
-)
 
 // NewNode creates a new processing node
 func NewNode[In, Out any](
@@ -146,13 +116,14 @@ func NewNode[In, Out any](
 		processor: processor,
 		jobQueue:  make(chan *Job[In], cfg.BufferSize),
 		next:      make([]INode, 0),
-		onError:   func(err error) { /* Default: no-op. Users should set custom error handler */ },
+		onError:   func(err error) {},
 	}
 
-	if cfg.CircuitBreaker.Enabled {
-		n.breaker = &CircuitBreaker{
-			config: cfg.CircuitBreaker,
-		}
+	n.jobPool = sync.Pool{
+		New: func() any {
+			job := &Job[In]{}
+			return job
+		},
 	}
 
 	return n
@@ -173,23 +144,16 @@ func (n *Node[In, Out]) Name() string {
 func (n *Node[In, Out]) Start(ctx context.Context) error {
 	n.ctx, n.cancel = context.WithCancel(ctx)
 
-	// Start worker goroutines
 	for i := 0; i < n.config.Workers; i++ {
 		n.workers.Add(1)
-		go n.work(i)
+		go n.work()
 	}
 
-	// Node started with n.config.Workers workers
 	return nil
 }
 
 // Process submits a job for processing
-func (n *Node[In, Out]) Process(ctx context.Context, jobData any) error {
-	// Check circuit breaker
-	if n.breaker != nil && !n.breaker.Allow() {
-		return fmt.Errorf("circuit breaker open for node %s", n.name)
-	}
-
+func (n *Node[In, Out]) Process(jobData any) error {
 	// Type assertion
 	data, ok := jobData.(In)
 	if !ok {
@@ -197,67 +161,69 @@ func (n *Node[In, Out]) Process(ctx context.Context, jobData any) error {
 			n.name, *new(In), jobData)
 	}
 
-	// Create job with result channel
-	job := &Job[In]{
-		ctx:    ctx,
-		data:   data,
-		result: make(chan Result, 1),
+	// Get job from pool
+	job := n.jobPool.Get().(*Job[In])
+	job.data = data
+
+	// Submit job to queue
+	if err := n.submit(job); err != nil {
+		// If submission fails, we must return the job to pool immediately
+		n.releaseJob(job)
+		return err
 	}
 
-	// Submit job with timeout
+	return nil
+}
+
+// releaseJob resets and returns a job to the pool
+func (n *Node[In, Out]) releaseJob(job *Job[In]) {
+	var zero In
+	job.data = zero // Avoid memory leaks
+	n.jobPool.Put(job)
+}
+
+// submit adds a job to the queue
+func (n *Node[In, Out]) submit(job *Job[In]) error {
 	select {
 	case n.jobQueue <- job:
 		n.metrics.CurrentQueueSize.Add(1)
-
-		// Wait for result
-		select {
-		case result := <-job.result:
-			if result.Err != nil {
-				return result.Err
-			}
-
-			// Forward to downstream nodes
-			if result.Data != nil && len(n.next) > 0 {
-				return n.forward(ctx, result.Data)
-			}
-
-			return nil
-
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-n.ctx.Done():
-			return ErrPipelineStopped
-		}
-
-	case <-ctx.Done():
-		return ctx.Err()
+		return nil
 	case <-n.ctx.Done():
 		return ErrPipelineStopped
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("timeout submitting job to node %s", n.name)
 	}
 }
 
 // work is the main worker loop
-func (n *Node[In, Out]) work(id int) {
+func (n *Node[In, Out]) work() {
 	defer n.workers.Done()
 	defer func() {
 		if r := recover(); r != nil {
-			n.onError(fmt.Errorf("worker %d panic: %v", id, r))
-			// Don't restart worker - let the pipeline handle worker pool size
+			n.onError(fmt.Errorf("worker panic: %v", r))
 		}
 	}()
 
 	for {
 		select {
 		case <-n.ctx.Done():
-			// Worker shutting down
 			return
-
-		case job := <-n.jobQueue:
+		case job, ok := <-n.jobQueue:
+			if !ok {
+				// Queue closed, propagate to downstream
+				n.propagateClose()
+				return
+			}
 			n.metrics.CurrentQueueSize.Add(-1)
 			n.processJob(job)
 		}
+	}
+}
+
+// propagateClose notifies all downstream nodes that input is closed
+func (n *Node[In, Out]) propagateClose() {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	for _, next := range n.next {
+		next.MarkInputClosed()
 	}
 }
 
@@ -268,24 +234,20 @@ func (n *Node[In, Out]) processJob(job *Job[In]) {
 	var result Out
 	var err error
 
-	// Retry logic
 	for attempt := 0; attempt <= n.config.MaxRetries; attempt++ {
-		// Check if job context is still valid
-		if job.ctx.Err() != nil {
-			job.result <- Result{Err: job.ctx.Err()}
+		// Check if pipeline is stopping
+		if n.ctx.Err() != nil {
+			n.releaseJob(job)
 			return
 		}
 
-		// Apply exponential backoff for retries
+		// Exponential backoff for retries
 		if attempt > 0 {
 			delay := n.config.RetryDelay * time.Duration(1<<(attempt-1))
 			select {
 			case <-time.After(delay):
-			case <-job.ctx.Done():
-				job.result <- Result{Err: job.ctx.Err()}
-				return
 			case <-n.ctx.Done():
-				job.result <- Result{Err: ErrPipelineStopped}
+				n.releaseJob(job)
 				return
 			}
 		}
@@ -297,8 +259,7 @@ func (n *Node[In, Out]) processJob(job *Job[In]) {
 					processingErr = fmt.Errorf("panic: %v", r)
 				}
 			}()
-
-			result, processingErr = n.processor(job.ctx, job.data)
+			result, processingErr = n.processor(n.ctx, job.data)
 			return processingErr
 		}()
 
@@ -313,60 +274,62 @@ func (n *Node[In, Out]) processJob(job *Job[In]) {
 
 	if err != nil {
 		n.metrics.FailedCount.Add(1)
-		if n.breaker != nil {
-			n.breaker.RecordFailure()
-		}
 		n.onError(fmt.Errorf("processing failed after %d attempts: %w",
 			n.config.MaxRetries+1, err))
-		job.result <- Result{Err: err}
+		n.releaseJob(job)
 	} else {
 		n.metrics.ProcessedCount.Add(1)
-		if n.breaker != nil {
-			n.breaker.RecordSuccess()
+		if fErr := n.forward(result); fErr != nil {
+			n.onError(fmt.Errorf("failed to forward result: %w", fErr))
 		}
-		job.result <- Result{Data: result, Err: nil}
+		// In Async mode, we are done with the job here
+		n.releaseJob(job)
 	}
 }
 
 // forward sends data to all downstream nodes
-func (n *Node[In, Out]) forward(ctx context.Context, data any) error {
+func (n *Node[In, Out]) forward(data any) error {
 	n.mu.RLock()
-	downstream := make([]INode, len(n.next))
-	copy(downstream, n.next)
-	n.mu.RUnlock()
-
-	if len(downstream) == 0 {
+	count := len(n.next)
+	if count == 0 {
+		n.mu.RUnlock()
 		return nil
 	}
 
-	// Process downstream nodes concurrently
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(downstream))
+	// Fast path: single downstream node
+	if count == 1 {
+		next := n.next[0]
+		n.mu.RUnlock()
+		return next.Process(data)
+	}
 
-	for _, node := range downstream {
-		wg.Add(1)
-		go func(next INode) {
+	// Copy for concurrent access
+	downstream := make([]INode, count)
+	copy(downstream, n.next)
+	n.mu.RUnlock()
+
+	// Fan-out to multiple downstream nodes
+	errCh := make(chan error, count)
+	var wg sync.WaitGroup
+	wg.Add(count)
+
+	for _, next := range downstream {
+		go func(node INode) {
 			defer wg.Done()
-			if err := next.Process(ctx, data); err != nil {
-				errCh <- fmt.Errorf("forward to %s failed: %w", next.Name(), err)
+			if err := node.Process(data); err != nil {
+				errCh <- err
 			}
-		}(node)
+		}(next)
 	}
 
 	wg.Wait()
 	close(errCh)
 
-	// Collect errors
 	var errs []error
 	for err := range errCh {
 		errs = append(errs, err)
 	}
-
-	if len(errs) > 0 {
-		return errors.Join(errs...)
-	}
-
-	return nil
+	return errors.Join(errs...)
 }
 
 // Connect adds a downstream node
@@ -374,6 +337,19 @@ func (n *Node[In, Out]) Connect(next INode) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.next = append(n.next, next)
+	next.AddUpstreamSource()
+}
+
+// AddUpstreamSource increments the upstream source count
+func (n *Node[In, Out]) AddUpstreamSource() {
+	n.upstreamSources.Add(1)
+}
+
+// MarkInputClosed decrements the upstream source count and closes the queue if zero
+func (n *Node[In, Out]) MarkInputClosed() {
+	if n.upstreamSources.Add(-1) == 0 {
+		close(n.jobQueue)
+	}
 }
 
 // Next returns all downstream nodes
@@ -388,62 +364,10 @@ func (n *Node[In, Out]) Next() []INode {
 
 // Wait blocks until all workers have finished
 func (n *Node[In, Out]) Wait() {
-	if n.cancel != nil {
-		n.cancel()
-	}
 	n.workers.Wait()
 }
 
 // Metrics returns the node's metrics
 func (n *Node[In, Out]) Metrics() *NodeMetrics {
 	return &n.metrics
-}
-
-// Allow checks if a request should be allowed
-func (cb *CircuitBreaker) Allow() bool {
-	state := cb.state.Load()
-
-	switch state {
-	case circuitClosed:
-		return true
-
-	case circuitOpen:
-		// Check if we should transition to half-open
-		lastFailure := time.Unix(0, cb.lastFailureTime.Load())
-		if time.Since(lastFailure) > cb.config.ResetTimeout {
-			if cb.state.CompareAndSwap(circuitOpen, circuitHalfOpen) {
-				cb.failures.Store(0)
-				// Circuit breaker transitioning to half-open
-			}
-			return true
-		}
-		return false
-
-	case circuitHalfOpen:
-		return true
-
-	default:
-		return true
-	}
-}
-
-// RecordFailure records a failure
-func (cb *CircuitBreaker) RecordFailure() {
-	failures := cb.failures.Add(1)
-	cb.lastFailureTime.Store(time.Now().UnixNano())
-
-	if failures >= int32(cb.config.FailureThreshold) {
-		if cb.state.CompareAndSwap(circuitHalfOpen, circuitOpen) ||
-			cb.state.CompareAndSwap(circuitClosed, circuitOpen) {
-			// Circuit breaker opened after failures threshold
-		}
-	}
-}
-
-// RecordSuccess records a success
-func (cb *CircuitBreaker) RecordSuccess() {
-	if cb.state.CompareAndSwap(circuitHalfOpen, circuitClosed) {
-		cb.failures.Store(0)
-		// Circuit breaker closed after successful request
-	}
 }

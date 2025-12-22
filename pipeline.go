@@ -20,10 +20,6 @@ type Pipeline struct {
 	state     atomic.Int32
 	startOnce sync.Once
 	stopOnce  sync.Once
-
-	// Error tracking
-	errorsMu sync.RWMutex
-	errors   []error
 }
 
 const (
@@ -39,12 +35,8 @@ func NewPipeline(root INode) (*Pipeline, error) {
 		return nil, errors.New("root node cannot be nil")
 	}
 
-	p := &Pipeline{
-		root:   root,
-		errors: make([]error, 0),
-	}
+	p := &Pipeline{root: root}
 
-	// Validate pipeline structure
 	if err := p.validate(); err != nil {
 		return nil, fmt.Errorf("pipeline validation failed: %w", err)
 	}
@@ -70,8 +62,10 @@ func (p *Pipeline) Start(ctx context.Context) error {
 			return
 		}
 
-		// Create pipeline context
 		p.ctx, p.cancel = context.WithCancel(ctx)
+
+		// Register pipeline as upstream source for root
+		p.root.AddUpstreamSource()
 
 		// Start all nodes
 		p.traverseNodes(func(node INode) {
@@ -80,7 +74,6 @@ func (p *Pipeline) Start(ctx context.Context) error {
 			}
 			if err := node.Start(p.ctx); err != nil {
 				startErr = fmt.Errorf("failed to start node %s: %w", node.Name(), err)
-				p.recordError(startErr)
 			}
 		})
 
@@ -105,10 +98,8 @@ func (p *Pipeline) Stop(timeout time.Duration) error {
 			return
 		}
 
-		// Cancel context to signal shutdown
-		if p.cancel != nil {
-			p.cancel()
-		}
+		// Signal root node to stop accepting new jobs and drain queue
+		p.root.MarkInputClosed()
 
 		// Wait for graceful shutdown with timeout
 		done := make(chan struct{})
@@ -119,11 +110,21 @@ func (p *Pipeline) Stop(timeout time.Duration) error {
 			close(done)
 		}()
 
-		select {
-		case <-done:
-			// Graceful shutdown completed
-		case <-time.After(timeout):
-			stopErr = errors.New("shutdown timeout exceeded")
+		if timeout > 0 {
+			select {
+			case <-done:
+				// Graceful shutdown completed
+			case <-time.After(timeout):
+				stopErr = errors.New("shutdown timeout exceeded")
+			}
+		} else {
+			// Wait indefinitely
+			<-done
+		}
+
+		// Always cancel context to ensure resources are released
+		if p.cancel != nil {
+			p.cancel()
 		}
 
 		p.state.Store(stateStopped)
@@ -133,44 +134,17 @@ func (p *Pipeline) Stop(timeout time.Duration) error {
 }
 
 // Send sends a job through the pipeline
-func (p *Pipeline) Send(ctx context.Context, job any) error {
+func (p *Pipeline) Send(job any) error {
 	if p.state.Load() != stateRunning {
 		return ErrPipelineStopped
 	}
 
-	return p.root.Process(ctx, job)
-}
-
-// SendWithTimeout sends a job with a specific timeout
-func (p *Pipeline) SendWithTimeout(job any, timeout time.Duration) error {
-	if p.ctx == nil {
-		return errors.New("pipeline not started")
-	}
-	ctx, cancel := context.WithTimeout(p.ctx, timeout)
-	defer cancel()
-	return p.Send(ctx, job)
-}
-
-// GetErrors returns all errors encountered during pipeline execution
-func (p *Pipeline) GetErrors() []error {
-	p.errorsMu.RLock()
-	defer p.errorsMu.RUnlock()
-
-	errors := make([]error, len(p.errors))
-	copy(errors, p.errors)
-	return errors
+	return p.root.Process(job)
 }
 
 // IsRunning returns true if the pipeline is currently running
 func (p *Pipeline) IsRunning() bool {
 	return p.state.Load() == stateRunning
-}
-
-// recordError records an error that occurred during execution
-func (p *Pipeline) recordError(err error) {
-	p.errorsMu.Lock()
-	defer p.errorsMu.Unlock()
-	p.errors = append(p.errors, err)
 }
 
 // traverseNodes applies a function to all nodes in the pipeline

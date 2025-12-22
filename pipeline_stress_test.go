@@ -47,8 +47,7 @@ func TestPipelineStress(t *testing.T) {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
 
-	ctx := context.Background()
-	if err := p.Start(ctx); err != nil {
+	if err := p.Start(context.Background()); err != nil {
 		t.Fatalf("Failed to start pipeline: %v", err)
 	}
 
@@ -65,7 +64,7 @@ func TestPipelineStress(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < numJobs/numSenders; i++ {
-				if err := p.SendWithTimeout(i, 5*time.Second); err != nil {
+				if err := p.Send(i); err != nil {
 					errors.Add(1)
 				}
 			}
@@ -115,14 +114,13 @@ func TestPipelineMemoryLeak(t *testing.T) {
 			t.Fatalf("Failed to create pipeline: %v", err)
 		}
 
-		ctx := context.Background()
-		if err := p.Start(ctx); err != nil {
+		if err := p.Start(context.Background()); err != nil {
 			t.Fatalf("Failed to start pipeline: %v", err)
 		}
 
 		// Send some jobs
 		for j := 0; j < 10; j++ {
-			p.SendWithTimeout(j, time.Second)
+			p.Send(j)
 		}
 
 		// Stop and ensure cleanup
@@ -146,7 +144,7 @@ func TestPipelineEdgeCases(t *testing.T) {
 		p, _ := NewPipeline(node)
 
 		// Try to send before starting
-		err := p.SendWithTimeout("test", time.Second)
+		err := p.Send("test")
 		if err == nil {
 			t.Error("Expected error when sending before start")
 		}
@@ -159,11 +157,10 @@ func TestPipelineEdgeCases(t *testing.T) {
 			})
 
 		p, _ := NewPipeline(node)
-		ctx := context.Background()
 
 		// Start twice - second call should be no-op due to sync.Once
-		err1 := p.Start(ctx)
-		err2 := p.Start(ctx)
+		err1 := p.Start(context.Background())
+		err2 := p.Start(context.Background())
 
 		if err1 != nil {
 			t.Errorf("First start failed: %v", err1)
@@ -182,8 +179,7 @@ func TestPipelineEdgeCases(t *testing.T) {
 			})
 
 		p, _ := NewPipeline(node)
-		ctx := context.Background()
-		p.Start(ctx)
+		p.Start(context.Background())
 
 		// Stop twice - second call should be no-op due to sync.Once
 		err1 := p.Stop(time.Second)
@@ -204,12 +200,11 @@ func TestPipelineEdgeCases(t *testing.T) {
 			})
 
 		p, _ := NewPipeline(node)
-		ctx := context.Background()
-		p.Start(ctx)
+		p.Start(context.Background())
 		p.Stop(time.Second)
 
 		// Try to send after stopping
-		err := p.SendWithTimeout("test", time.Second)
+		err := p.Send("test")
 		if err != ErrPipelineStopped {
 			t.Errorf("Expected ErrPipelineStopped, got %v", err)
 		}
@@ -240,11 +235,10 @@ func TestPipelineEdgeCases(t *testing.T) {
 			})
 
 		p, _ := NewPipeline(node)
-		ctx := context.Background()
-		p.Start(ctx)
+		p.Start(context.Background())
 
 		large := LargeStruct{}
-		err := p.SendWithTimeout(large, 5*time.Second)
+		err := p.Send(large)
 		if err != nil {
 			t.Errorf("Failed to process large data: %v", err)
 		}
@@ -255,29 +249,28 @@ func TestPipelineEdgeCases(t *testing.T) {
 
 // TestNodeMetrics tests metrics collection accuracy
 func TestNodeMetrics(t *testing.T) {
-	processed := 0
 	config := DefaultConfig()
+	config.Workers = 1 // Single worker for predictable metrics
 
 	node := NewNode[int, int]("metrics",
 		func(ctx context.Context, i int) (int, error) {
-			processed++
 			time.Sleep(10 * time.Millisecond)
 			return i * 2, nil
 		}, config)
 
 	p, _ := NewPipeline(node)
-	ctx := context.Background()
-	p.Start(ctx)
+	p.Start(context.Background())
 
 	const numJobs = 10
 	for i := 0; i < numJobs; i++ {
-		if err := p.SendWithTimeout(i, time.Second); err != nil {
+		if err := p.Send(i); err != nil {
 			t.Errorf("Failed to send job %d: %v", i, err)
 		}
 	}
 
-	// Wait for processing
-	time.Sleep(200 * time.Millisecond)
+	// Wait for processing to complete
+	time.Sleep(100 * time.Millisecond)
+	p.Stop(time.Second)
 
 	metrics := node.Metrics()
 	if metrics.ProcessedCount.Load() != int64(numJobs) {
@@ -288,6 +281,4 @@ func TestNodeMetrics(t *testing.T) {
 	if avgLatency < 10*time.Millisecond || avgLatency > 20*time.Millisecond {
 		t.Errorf("Unexpected average latency: %v", avgLatency)
 	}
-
-	p.Stop(time.Second)
 }
