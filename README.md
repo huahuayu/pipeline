@@ -16,7 +16,7 @@ A high-performance pipeline library for Go.
 - [Quick Start](#quick-start)
 - [Core Concepts](#core-concepts)
 - [Configuration](#configuration)
-- [Building DAGs](#building-dags)
+- [Building Different Pipelines](#building-different-pipelines)
 - [Error Handling](#error-handling)
 - [Metrics & Monitoring](#metrics--monitoring)
 - [Performance](#performance)
@@ -163,7 +163,7 @@ node := pipeline.NewNode[In, Out]("name", processor, config)
 | `Workers`    | Lower CPU usage                      | Higher parallelism             |
 | `MaxRetries` | Fail fast                            | More resilient, higher latency |
 
-## Building DAGs
+## Building Different Pipelines
 
 ### Linear Pipeline
 
@@ -252,26 +252,6 @@ config := pipeline.NodeConfig{
 }
 
 // Retry delays: 100ms -> 200ms -> 400ms (exponential backoff)
-```
-
-## Async Mode
-
-By default, `p.Send()` blocks until the item traverses the entire pipeline. For high-throughput scenarios where you want "fire-and-forget" behavior, enable Async Mode:
-
-```go
-config := pipeline.NodeConfig{
-    Workers: 4,
-    Async:   true, // Enable non-blocking execution
-}
-
-node := pipeline.NewNode[int, int]("worker", processor, config)
-    .WithErrorHandler(func(err error) {
-        // Handle errors asynchronously
-        log.Printf("Processing failed: %v", err)
-    })
-
-// Returns immediately (nil if queue has space)
-err := p.Send(data)
 ```
 
 ## Graceful Shutdown
@@ -389,7 +369,7 @@ go test -v -run TestComplexDAG
 
 - ✅ **Type-safe generics** — Full compile-time type checking
 - ✅ **DAG support** — Build any directed acyclic graph
-  - ✅ **Simple API** — Just `Start(ctx)`, `Send()`, `Stop()`
+- ✅ **Simple API** — Just `Start(ctx)`, `Send()`, `Stop()`
 - ✅ **Panic recovery** — Workers handle panics gracefully
 - ✅ **Built-in metrics** — Throughput, latency, queue sizes
 - ✅ **Exponential backoff** — Smart retry logic
